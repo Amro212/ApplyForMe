@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022", "DOM"],
+    "jsx": "react-jsx",
+    "strict": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "ignoreDeprecations": "6.0",
+    "baseUrl": ".",
+    "types": ["node", "vite/client", "vitest/globals"],
+    "paths": {
+      "@profile/*": ["src/profile/*"],
+      "@jobs/*": ["src/jobs/*"],
+      "@shared/*": ["src/shared/*"],
+      "@ui/*": ["ui/src/*"]
+    }
+  },
+  "include": ["src/**/*", "ui/src/**/*", "tests/**/*", "vite.config.ts", "vitest.config.ts"]
+}

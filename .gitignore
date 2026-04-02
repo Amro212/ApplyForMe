@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+profiles/user.json
+profiles/jobs.json
+logs/applications.json
+logs/screenshots/
+coverage/
