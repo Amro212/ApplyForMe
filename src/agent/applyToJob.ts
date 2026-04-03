@@ -117,8 +117,8 @@ function createUploadDebugLogger(jobId: string): { logPath: string; log: UploadD
 }
 
 function getAgentExecutionTimeoutMs(): number {
-  const parsed = Number(process.env.AGENT_EXECUTION_TIMEOUT_MS ?? "90000");
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 90000;
+  const parsed = Number(process.env.AGENT_EXECUTION_TIMEOUT_MS ?? "0");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
 function normalizeStatus(
@@ -981,6 +981,15 @@ async function runSubmitPhase(
 async function executeAgent(agent: NonStreamingAgentInstance, options: AgentExecuteOptions): Promise<AgentResult> {
   const timeoutMs = getAgentExecutionTimeoutMs();
   const controller = new AbortController();
+  
+  // If timeout is 0, don't set any timeout (let it run indefinitely)
+  if (timeoutMs === 0) {
+    return await agent.execute({
+      ...options,
+      signal: controller.signal,
+    });
+  }
+  
   let timeoutHandle: NodeJS.Timeout | undefined;
   const timeoutPromise = new Promise<AgentResult>((_, reject) => {
     timeoutHandle = setTimeout(() => {
