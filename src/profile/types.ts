@@ -38,6 +38,15 @@ export interface Reference {
   relationship: string;
 }
 
+export interface AttachmentMapping {
+  id: string;
+  labelContains: string;
+  filePath: string;
+}
+
+export type SubmissionMode = "review_before_submit" | "auto_submit";
+export type KeepBrowserOpenPolicy = "never" | "failures_and_review" | "always";
+
 export interface UserProfile {
   personal: {
     firstName: string;
@@ -84,8 +93,11 @@ export interface UserProfile {
   settings: {
     coverLetterStyle: "formal" | "conversational" | "technical";
     resumePath: string;
+    coverLetterPath: string;
+    attachmentMappings: AttachmentMapping[];
+    submissionMode: SubmissionMode;
+    keepBrowserOpenPolicy: KeepBrowserOpenPolicy;
     defaultAnswerForUnknown: "leave blank" | "prefer not to say";
-    stopBeforeSubmit: boolean;
     screenshotOnComplete: boolean;
   };
 }

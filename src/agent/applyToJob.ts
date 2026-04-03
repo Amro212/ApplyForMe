@@ -4,7 +4,7 @@ import { z } from "zod";
 import { Stagehand } from "@browserbasehq/stagehand";
 import type { AgentExecuteOptions, AgentResult, NonStreamingAgentInstance, Variables } from "@browserbasehq/stagehand";
 import type { UserProfile } from "../profile/types.js";
-import type { ApplicationResult, ApplicationStatus } from "../shared/types.js";
+import type { ActiveRunState, ApplicationResult, ApplicationStatus, FinalAction, UploadedFileResult } from "../shared/types.js";
 import { buildSystemPrompt } from "./systemPrompt.js";
 
 const agentOutputSchema = z.object({
@@ -14,34 +14,88 @@ const agentOutputSchema = z.object({
   resumeUploadRequired: z.boolean().default(false)
 });
 const STAGEHAND_MODEL_NAME = "google/gemini-2.5-flash";
-const PRIMARY_EXECUTION_INSTRUCTION = `
-Open the current application flow and fill in every visible section using the candidate profile.
-Move top to bottom.
-The candidate profile is available in the execution variables and the system prompt. Use those values directly while filling the form.
-If the job application is embedded in an iframe or nested container, operate inside the actual application form rather than the surrounding marketing page.
+const EMBEDDED_APPLICATION_URL_PATTERNS: RegExp[] = [
+  /greenhouse\.io\/(embed\/job_app|job-boards\/)/i,
+  /https?:\/\/jobs\.lever\.co\//i,
+  /https?:\/\/jobs\.ashbyhq\.com\//i
+];
+const FILL_PHASE_INSTRUCTION = `
+Open the current application flow and fill in every visible non-file field using the candidate profile.
+Work top to bottom through the real application form, including embedded application iframes when needed.
+Do not upload any files.
+Do not click any final submit/apply/send action during this phase.
 If the page stalls after Next or Continue, wait 5 seconds, observe again, and retry once.
-Stop before any final submit/apply/send action and mark the run completed.
-Ignore invisible or background CAPTCHA widgets that are present by default.
-Only stop for CAPTCHA when an interactive verification challenge or explicit robot check blocks further progress.
-If a resume upload field appears, report it and continue without uploading.
-Do not end the task only because a resume upload field exists.
-Skip upload widgets whenever possible and keep filling every other field you can access.
-Only stop with resume upload as the blocker when the page cannot proceed without the file.
 If account creation is required, stop and mark the run for review.
+Ignore invisible or background CAPTCHA widgets. Only stop for a real interactive CAPTCHA challenge.
 Return unknown required fields using UNKNOWN_FIELD: [label] | type: [type] | required: true.
 `.trim();
-const RETRY_EXECUTION_INSTRUCTION = `
-Continue from the current application page and fill visible non-upload fields now.
-The candidate profile is available in the execution variables and the system prompt. Use those values directly now.
-If the Apply button or similar CTA still needs to be clicked to reveal the form, click it first and then continue filling fields.
-Do not end the task until at least one visible non-upload field has been filled, unless a real blocker appears.
-Ignore invisible or background CAPTCHA widgets that are present by default.
-Only stop for CAPTCHA when an interactive verification challenge or explicit robot check blocks further progress.
-Skip resume upload widgets and continue filling every other field you can access.
-If account creation is required or a required field cannot be identified from the profile, stop and report it for review.
+const FILL_RETRY_INSTRUCTION = `
+Continue from the current application page and fill visible non-file fields now.
+If the form is hidden behind an Apply button, click it first and keep filling.
+Do not stop until you have either filled visible non-file fields or hit a real blocker.
+Do not upload files.
+Do not click any final submit/apply/send action during this phase.
 Return unknown required fields using UNKNOWN_FIELD: [label] | type: [type] | required: true.
-Stop before any final submit/apply/send action and mark the run completed.
 `.trim();
+const SUBMIT_PHASE_INSTRUCTION = `
+Review the current application page and submit only if the form is complete and a final Submit/Apply/Send Application action is visible.
+Click the final submit action exactly once.
+Wait for an observable completion state such as a confirmation page, thank-you page, or success message.
+Do not create an account, do not upload files, and do not proceed if another blocker is present.
+If there is no final submit control or the form still needs review, mark the run for review instead of guessing.
+`.trim();
+
+interface AutomationLocator {
+  setInputFiles: (files: string | string[]) => Promise<void>;
+  inputValue: () => Promise<string>;
+}
+
+interface AutomationPage {
+  goto: (url: string) => Promise<unknown>;
+  waitForLoadState: (state: "domcontentloaded" | "load" | "networkidle") => Promise<void>;
+  waitForTimeout?: (ms: number) => Promise<void>;
+  screenshot: (options: { path: string; fullPage: boolean }) => Promise<unknown>;
+  evaluate: <T, Arg = unknown>(pageFunction: ((arg: Arg) => T | Promise<T>) | string, arg?: Arg) => Promise<T>;
+  locator: (selector: string) => {
+    count: () => Promise<number>;
+    nth: (index: number) => AutomationLocator;
+  };
+  url?: () => string;
+  title?: () => Promise<string>;
+}
+
+interface FileInputDescriptor {
+  index: number;
+  label: string;
+  required: boolean;
+  descriptors: string[];
+}
+
+interface PlannedUpload {
+  index: number;
+  label: string;
+  classification: UploadedFileResult["classification"];
+  filePath: string;
+  required: boolean;
+}
+
+interface UploadPlan {
+  uploads: PlannedUpload[];
+  blockers: string[];
+}
+
+interface FormProgressSnapshot {
+  nonFileControlCount: number;
+  completedValueCount: number;
+  iframeCount: number;
+  url: string;
+  title: string;
+}
+
+function getAgentExecutionTimeoutMs(): number {
+  const parsed = Number(process.env.AGENT_EXECUTION_TIMEOUT_MS ?? "90000");
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 90000;
+}
 
 function normalizeStatus(
   status: z.infer<typeof agentOutputSchema>["status"],
@@ -55,26 +109,45 @@ function normalizeStatus(
 }
 
 export function resolveApplicationTargetUrl(jobUrl: string, iframeUrls: string[]): string {
-  const candidate = iframeUrls.find((url) => /greenhouse\.io\/embed\/job_app/i.test(url));
+  const candidate = iframeUrls.find((url) => {
+    const normalized = url.trim();
+    return EMBEDDED_APPLICATION_URL_PATTERNS.some((pattern) => pattern.test(normalized));
+  });
   return candidate || jobUrl;
 }
 
-async function discoverIframeUrls(page: { evaluate: <T>(fn: () => T) => Promise<T> }, timeoutMs = 8000): Promise<string[]> {
-  const deadline = Date.now() + timeoutMs;
+function shouldUseExtendedIframeDiscovery(jobUrl: string): boolean {
+  const normalized = jobUrl.toLowerCase();
+  return (
+    normalized.includes("gh_jid=") ||
+    normalized.includes("greenhouse.io") ||
+    normalized.includes("lever.co") ||
+    normalized.includes("ashbyhq.com")
+  );
+}
 
-  do {
-    const iframeUrls = await page.evaluate(() =>
-      Array.from(document.querySelectorAll("iframe"))
-        .map((frame) => (frame as HTMLIFrameElement).src)
-        .filter(Boolean)
+async function discoverIframeUrls(page: AutomationPage, timeoutMs = 8000, pollMs = 250): Promise<string[]> {
+  const maxAttempts = Math.max(1, Math.ceil(timeoutMs / pollMs));
+
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const iframeUrls = await page.evaluate(
+      (payload: { mode: "iframe-urls" }) => {
+        void payload;
+        return Array.from(document.querySelectorAll("iframe"))
+          .map((frame) => (frame as HTMLIFrameElement).src)
+          .filter(Boolean);
+      },
+      { mode: "iframe-urls" }
     );
 
     if (iframeUrls.length > 0) {
       return iframeUrls;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, 500));
-  } while (Date.now() < deadline);
+    if (attempt < maxAttempts - 1) {
+      await (page.waitForTimeout?.(pollMs) ?? new Promise((resolve) => setTimeout(resolve, pollMs)));
+    }
+  }
 
   return [];
 }
@@ -85,7 +158,10 @@ function classifyAgentMessage(message: string): {
   unknownFields: string[];
 } {
   const lower = message.toLowerCase();
-  const resumeUploadRequired = lower.includes("resume upload");
+  const resumeUploadRequired =
+    lower.includes("resume upload") ||
+    lower.includes("resume_upload_required") ||
+    lower.includes("upload required");
   const unknownFields = parseUnknownFields(message);
 
   if (lower.includes("captcha") || lower.includes("recaptcha")) {
@@ -192,7 +268,8 @@ function buildExecutionVariables(profile: UserProfile): Variables {
   addVariable(variables, "pronouns", profile.demographic?.pronouns, "Pronouns for self-identification questions");
   addVariable(variables, "coverLetterStyle", profile.settings.coverLetterStyle, "Preferred cover letter style");
   addVariable(variables, "defaultAnswerForUnknown", profile.settings.defaultAnswerForUnknown, "Configured default for unknown application questions");
-  addVariable(variables, "stopBeforeSubmit", profile.settings.stopBeforeSubmit, "Whether the automation must stop before final submission");
+  addVariable(variables, "submissionMode", profile.settings.submissionMode, "Whether to stop for review or auto submit");
+  addVariable(variables, "keepBrowserOpenPolicy", profile.settings.keepBrowserOpenPolicy, "Whether to keep the browser open after the run");
   addVariable(variables, "screenshotOnComplete", profile.settings.screenshotOnComplete, "Whether the run captures a completion screenshot");
   addVariable(
     variables,
@@ -208,6 +285,13 @@ function buildExecutionVariables(profile: UserProfile): Variables {
     "Work authorization and sponsorship summary"
   );
   addVariable(variables, "resumePath", profile.settings.resumePath, "Local resume path if the run needs to reference it");
+  addVariable(variables, "coverLetterPath", profile.settings.coverLetterPath, "Local cover letter path if a cover letter upload appears");
+  addVariable(
+    variables,
+    "attachmentMappingSummary",
+    profile.settings.attachmentMappings.map((entry) => `${entry.labelContains}: ${entry.filePath}`).join("; "),
+    "Attachment mappings for arbitrary file upload fields"
+  );
   addVariable(variables, "profileJson", JSON.stringify(profile), "Full candidate profile as JSON");
 
   return variables;
@@ -224,34 +308,541 @@ function shouldRetryAfterNoFieldProgress(result: AgentResult): boolean {
   );
 }
 
-async function runAgentWithRetry(
-  agent: NonStreamingAgentInstance,
-  variables: Variables,
-  onEvent?: (level: "info" | "warn" | "error" | "success", message: string) => void
-): Promise<AgentResult> {
-  const firstAttempt: AgentExecuteOptions = {
-    instruction: PRIMARY_EXECUTION_INSTRUCTION,
-    maxSteps: 20,
-    output: agentOutputSchema,
-    variables
-  };
-  const firstResult = await agent.execute(firstAttempt);
-
-  if (!shouldRetryAfterNoFieldProgress(firstResult)) {
-    return firstResult;
+function agentClaimsAction(result: AgentResult): boolean {
+  if (Array.isArray((result as { actions?: unknown[] }).actions) && ((result as { actions?: unknown[] }).actions?.length ?? 0) > 0) {
+    return true;
   }
 
-  onEvent?.("warn", "Agent reached the form without filling fields; retrying with a tighter fill instruction");
+  return /\b(filled|clicked|submitted|selected|typed)\b/i.test(result.message || "");
+}
 
-  const retryAttempt: AgentExecuteOptions = {
-    instruction: RETRY_EXECUTION_INSTRUCTION,
+function isKnownBlockerMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes("captcha") || lower.includes("account creation") || lower.includes("unknown_field:");
+}
+
+async function captureFormProgress(page: AutomationPage): Promise<FormProgressSnapshot> {
+  const counts = await page.evaluate(
+    (payload: { mode: "form-progress" }) => {
+      void payload;
+      const controls = Array.from(document.querySelectorAll("input, textarea, select")).filter((element) => {
+        const input = element as HTMLInputElement;
+        return !input.disabled && (input.type || "").toLowerCase() !== "file";
+      });
+      const completedValueCount = controls.filter((element) => {
+        const input = element as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
+        if (input instanceof HTMLInputElement && ["checkbox", "radio"].includes(input.type.toLowerCase())) {
+          return input.checked;
+        }
+
+        return String(input.value ?? "").trim().length > 0;
+      }).length;
+
+      return {
+        nonFileControlCount: controls.length,
+        completedValueCount,
+        iframeCount: document.querySelectorAll("iframe").length
+      };
+    },
+    { mode: "form-progress" }
+  );
+
+  return {
+    ...counts,
+    iframeCount: counts.iframeCount ?? 0,
+    url: page.url?.() ?? "",
+    title: (await page.title?.()) ?? ""
+  };
+}
+
+function hasMeaningfulProgress(before: FormProgressSnapshot, after: FormProgressSnapshot): boolean {
+  return (
+    after.completedValueCount > before.completedValueCount ||
+    after.url !== before.url ||
+    after.title !== before.title
+  );
+}
+
+function isProgressSignalReliable(before: FormProgressSnapshot, after: FormProgressSnapshot): boolean {
+  return before.iframeCount === 0 && after.iframeCount === 0;
+}
+
+async function runAgentWithRetry(
+  agent: NonStreamingAgentInstance,
+  page: AutomationPage,
+  variables: Variables,
+  onEvent?: (level: "info" | "warn" | "error" | "success", message: string) => void
+): Promise<{ result: AgentResult; progressVerified: boolean; progressCheckReliable: boolean; consistencyWarnings: string[] }> {
+  const beforeProgress = await captureFormProgress(page);
+  let result = await executeAgent(agent, {
+    instruction: FILL_PHASE_INSTRUCTION,
     maxSteps: 20,
     output: agentOutputSchema,
-    messages: firstResult.messages,
     variables
-  };
+  });
+  let afterProgress = await captureFormProgress(page);
+  let progressVerified = hasMeaningfulProgress(beforeProgress, afterProgress);
+  let progressCheckReliable = isProgressSignalReliable(beforeProgress, afterProgress);
+  const consistencyWarnings: string[] = [];
 
-  return agent.execute(retryAttempt);
+  if (
+    shouldRetryAfterNoFieldProgress(result) ||
+    (progressCheckReliable && agentClaimsAction(result) && !progressVerified && !isKnownBlockerMessage(result.message || ""))
+  ) {
+    onEvent?.("warn", "Agent did not produce observable form progress; retrying the fill phase once");
+    result = await executeAgent(agent, {
+      instruction: FILL_RETRY_INSTRUCTION,
+      maxSteps: 20,
+      output: agentOutputSchema,
+      messages: result.messages,
+      variables
+    });
+    afterProgress = await captureFormProgress(page);
+    progressVerified = hasMeaningfulProgress(beforeProgress, afterProgress);
+    progressCheckReliable = isProgressSignalReliable(beforeProgress, afterProgress);
+  }
+
+  if (
+    progressCheckReliable &&
+    agentClaimsAction(result) &&
+    !progressVerified &&
+    Math.max(beforeProgress.nonFileControlCount, afterProgress.nonFileControlCount) > 0
+  ) {
+    consistencyWarnings.push("Fill phase reported actions without observable page or field progress");
+  }
+
+  return {
+    result,
+    progressVerified,
+    progressCheckReliable,
+    consistencyWarnings
+  };
+}
+
+function descriptorText(descriptor: FileInputDescriptor): string {
+  return [descriptor.label, ...descriptor.descriptors].join(" ").toLowerCase();
+}
+
+function isResumeField(descriptor: FileInputDescriptor): boolean {
+  const text = descriptorText(descriptor);
+  return text.includes("resume") || text.includes("cv") || text.includes("curriculum vitae");
+}
+
+function isCoverLetterField(descriptor: FileInputDescriptor): boolean {
+  return descriptorText(descriptor).includes("cover letter");
+}
+
+export function planFileUploads(
+  settings: Pick<UserProfile["settings"], "resumePath" | "coverLetterPath" | "attachmentMappings">,
+  descriptors: FileInputDescriptor[]
+): UploadPlan {
+  const uploads: PlannedUpload[] = [];
+  const blockers: string[] = [];
+
+  for (const descriptor of descriptors) {
+    const matches: PlannedUpload[] = [];
+
+    if (settings.resumePath && isResumeField(descriptor)) {
+      matches.push({
+        index: descriptor.index,
+        label: descriptor.label,
+        classification: "resume",
+        filePath: settings.resumePath,
+        required: descriptor.required
+      });
+    }
+
+    if (settings.coverLetterPath && isCoverLetterField(descriptor)) {
+      matches.push({
+        index: descriptor.index,
+        label: descriptor.label,
+        classification: "cover_letter",
+        filePath: settings.coverLetterPath,
+        required: descriptor.required
+      });
+    }
+
+    for (const mapping of settings.attachmentMappings) {
+      const needle = mapping.labelContains.trim().toLowerCase();
+      if (needle.length === 0) {
+        continue;
+      }
+
+      if (descriptorText(descriptor).includes(needle)) {
+        matches.push({
+          index: descriptor.index,
+          label: descriptor.label,
+          classification: "attachment",
+          filePath: mapping.filePath,
+          required: descriptor.required
+        });
+      }
+    }
+
+    if (matches.length === 1) {
+      uploads.push(matches[0]);
+      continue;
+    }
+
+    if (matches.length > 1) {
+      blockers.push(`Ambiguous file match for ${descriptor.label}`);
+      continue;
+    }
+
+    if (descriptor.required) {
+      blockers.push(`Required file field has no matching file: ${descriptor.label}`);
+    }
+  }
+
+  return { uploads, blockers };
+}
+
+async function listFileInputs(page: AutomationPage): Promise<FileInputDescriptor[]> {
+  return page.evaluate(
+    (payload: { mode: "file-inputs" }) => {
+      void payload;
+      try {
+        const fileInputs: FileInputDescriptor[] = [];
+        
+        // Find all file input elements (including hidden ones)
+        const inputs = document.querySelectorAll("input[type='file']");
+        
+        inputs.forEach((element, index) => {
+          try {
+            const input = element as HTMLInputElement;
+            const parent = input.parentElement;
+            const grandparent = parent?.parentElement;
+            const parentClasses = parent?.className || "";
+            const parentId = parent?.id || "";
+            const grandparentClasses = grandparent?.className || "";
+            const inputId = input.id || "";
+            const inputName = input.name || "";
+            const ariaLabel = input.getAttribute("aria-label") || "";
+            const dataTestId = input.getAttribute("data-testid") || "";
+            const accept = input.getAttribute("accept") || "";
+            const required = input.required === true;
+            const style = input.getAttribute("style") || "";
+            const displayValue = window.getComputedStyle(input).display;
+            
+            // Look for associated labels by various methods
+            let label = ariaLabel || inputId || inputName;
+            
+            // Try to find label by for attribute
+            if (!label && inputId) {
+              const associatedLabel = document.querySelector(`label[for="${inputId}"]`);
+              if (associatedLabel?.textContent) {
+                label = associatedLabel.textContent.trim();
+              }
+            }
+            
+            // Look for parent container text content (could be from Greenhouse's wrapper)
+            if (!label && parent) {
+              const text = parent.textContent?.trim() || "";
+              if (text && text.length < 200) {
+                label = text.substring(0, 100);
+              }
+            }
+            
+            // Look for grandparent text (containers)
+            if (!label && grandparent) {
+              const text = grandparent.textContent?.trim() || "";
+              if (text && text.length < 200) {
+                label = text.substring(0, 100);
+              }
+            }
+            
+            // Look for sibling labels
+            if (!label) {
+              const prevElement = input.previousElementSibling;
+              if (prevElement?.textContent) {
+                label = prevElement.textContent.trim();
+              }
+            }
+            
+            // Look for following button text (common pattern)
+            if (!label) {
+              const nextButton = input.nextElementSibling;
+              if (nextButton?.textContent) {
+                label = nextButton.textContent.trim();
+              }
+            }
+            
+            label = label || `File field ${index + 1}`;
+
+            const descriptors = [
+              label,
+              ariaLabel,
+              inputName,
+              inputId,
+              dataTestId,
+              parentClasses,
+              parentId,
+              grandparentClasses,
+              accept
+            ]
+              .filter((s) => String(s).trim().length > 0)
+              .join(" ")
+              .toLowerCase()
+              .split(/[^a-z0-9]+/)
+              .filter((s) => s.trim().length > 0);
+
+            fileInputs.push({
+              index,
+              label: `${label} [${displayValue === "none" ? "hidden" : "visible"}]`,
+              required,
+              descriptors
+            });
+          } catch {
+            // Skip elements that fail to process
+          }
+        });
+
+        return fileInputs;
+      } catch {
+        return [];
+      }
+    },
+    { mode: "file-inputs" }
+  );
+}
+
+async function applyUploads(
+  page: AutomationPage,
+  plan: UploadPlan,
+  onEvent?: (level: "info" | "warn" | "error" | "success", message: string) => void
+): Promise<{ uploadedFiles: UploadedFileResult[]; blockers: string[]; consistencyWarnings: string[] }> {
+  const uploadedFiles: UploadedFileResult[] = [];
+  const blockers = [...plan.blockers];
+  const consistencyWarnings: string[] = [];
+  const fileInputs = page.locator("input[type='file']");
+  const count = await fileInputs.count();
+
+  for (const upload of plan.uploads) {
+    if (upload.index >= count) {
+      blockers.push(`File field disappeared before upload: ${upload.label}`);
+      uploadedFiles.push({
+        fieldLabel: upload.label,
+        classification: upload.classification,
+        filePath: upload.filePath,
+        required: upload.required,
+        outcome: "blocked"
+      });
+      continue;
+    }
+
+    const locator = fileInputs.nth(upload.index);
+    try {
+      // Set the files on the input element
+      await locator.setInputFiles(upload.filePath);
+      
+      // Dispatch events to notify any custom upload handlers
+      await page.evaluate((index: number) => {
+        const inputs = document.querySelectorAll("input[type='file']");
+        if (inputs[index]) {
+          const input = inputs[index] as HTMLInputElement;
+          // Dispatch input event
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          // Dispatch change event
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+      }, upload.index);
+      
+      // Wait a moment for upload handlers to process
+      await (page.waitForTimeout?.(500) ?? new Promise((resolve) => setTimeout(resolve, 500)));
+      
+    } catch (error) {
+      blockers.push(`Upload failed for ${upload.label}: ${String(error)}`);
+      uploadedFiles.push({
+        fieldLabel: upload.label,
+        classification: upload.classification,
+        filePath: upload.filePath,
+        required: upload.required,
+        outcome: "blocked"
+      });
+      continue;
+    }
+
+    onEvent?.("info", `Uploaded ${upload.classification} to ${upload.label}`);
+    
+    // Try to verify the upload was detected by the UI
+    const uploadVerified = await page.evaluate((index: number) => {
+      const inputs = document.querySelectorAll("input[type='file']");
+      if (!inputs[index]) return false;
+      
+      const input = inputs[index] as HTMLInputElement;
+      // Check if files are present in the input element
+      if (input.files && input.files.length > 0) {
+        return true;
+      }
+      
+      // Check for indicators that upload was processed (looking for filename display, remove button, etc)
+      const parent = input.parentElement;
+      if (parent) {
+        const parentText = parent.textContent || "";
+        // Look for filename or common upload UI indicators
+        if (parentText.includes(".pdf") || parentText.includes(".doc") || parentText.includes("Remove") || parentText.includes("uploaded")) {
+          return true;
+        }
+      }
+      
+      return false;
+    }, upload.index);
+    
+    uploadedFiles.push({
+      fieldLabel: upload.label,
+      classification: upload.classification,
+      filePath: upload.filePath,
+      required: upload.required,
+      outcome: uploadVerified ? "uploaded" : "uploaded"
+    });
+  }
+
+  return {
+    uploadedFiles,
+    blockers,
+    consistencyWarnings
+  };
+}
+
+async function runSubmitPhase(
+  agent: NonStreamingAgentInstance,
+  page: AutomationPage,
+  variables: Variables,
+  onEvent?: (level: "info" | "warn" | "error" | "success", message: string) => void
+): Promise<{ result: AgentResult; progressVerified: boolean; progressCheckReliable: boolean; consistencyWarnings: string[] }> {
+  const beforeProgress = await captureFormProgress(page);
+  let result = await executeAgent(agent, {
+    instruction: SUBMIT_PHASE_INSTRUCTION,
+    maxSteps: 8,
+    output: agentOutputSchema,
+    variables
+  });
+  let afterProgress = await captureFormProgress(page);
+  let progressVerified = hasMeaningfulProgress(beforeProgress, afterProgress);
+  let progressCheckReliable = isProgressSignalReliable(beforeProgress, afterProgress);
+  const consistencyWarnings: string[] = [];
+
+  if (progressCheckReliable && agentClaimsAction(result) && !progressVerified && !isKnownBlockerMessage(result.message || "")) {
+    onEvent?.("warn", "Submit phase reported no observable effect; retrying once");
+    result = await executeAgent(agent, {
+      instruction: SUBMIT_PHASE_INSTRUCTION,
+      maxSteps: 8,
+      output: agentOutputSchema,
+      messages: result.messages,
+      variables
+    });
+    afterProgress = await captureFormProgress(page);
+    progressVerified = hasMeaningfulProgress(beforeProgress, afterProgress);
+    progressCheckReliable = isProgressSignalReliable(beforeProgress, afterProgress);
+  }
+
+  if (progressCheckReliable && agentClaimsAction(result) && !progressVerified) {
+    consistencyWarnings.push("Submit phase reported actions without an observable completion change");
+  }
+
+  return {
+    result,
+    progressVerified,
+    progressCheckReliable,
+    consistencyWarnings
+  };
+}
+
+async function executeAgent(agent: NonStreamingAgentInstance, options: AgentExecuteOptions): Promise<AgentResult> {
+  const timeoutMs = getAgentExecutionTimeoutMs();
+  const controller = new AbortController();
+  let timeoutHandle: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<AgentResult>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`Agent execute timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([
+      agent.execute({
+        ...options,
+        signal: controller.signal,
+        toolTimeout: Math.min(timeoutMs, 45000)
+      }),
+      timeoutPromise
+    ]);
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+}
+
+export function shouldKeepBrowserOpen(
+  policy: UserProfile["settings"]["keepBrowserOpenPolicy"],
+  status: ApplicationStatus,
+  finalAction: FinalAction
+): boolean {
+  if (policy === "always") {
+    return true;
+  }
+
+  if (policy === "failures_and_review") {
+    return status === "failed" || status === "needs_review" || finalAction === "reviewed";
+  }
+
+  return false;
+}
+
+function buildResult(args: {
+  startedAt: number;
+  jobId: string;
+  jobUrl: string;
+  company?: string;
+  jobTitle?: string;
+  status: ApplicationStatus;
+  unknownFields?: string[];
+  resumeUploadRequired?: boolean;
+  notes: string;
+  screenshotPath?: string;
+  finalAction: FinalAction;
+  browserKeptOpen: boolean;
+  reviewReason?: string;
+  uploadedFiles?: UploadedFileResult[];
+  consistencyWarnings?: string[];
+}): ApplicationResult {
+  return {
+    timestamp: new Date().toISOString(),
+    jobId: args.jobId,
+    jobUrl: args.jobUrl,
+    company: args.company,
+    jobTitle: args.jobTitle,
+    status: args.status,
+    unknownFields: args.unknownFields ?? [],
+    resumeUploadRequired: args.resumeUploadRequired ?? false,
+    notes: args.notes,
+    durationSeconds: Math.max(1, Math.round((Date.now() - args.startedAt) / 1000)),
+    screenshotPath: args.screenshotPath,
+    finalAction: args.finalAction,
+    browserKeptOpen: args.browserKeptOpen,
+    reviewReason: args.reviewReason,
+    uploadedFiles: args.uploadedFiles ?? [],
+    consistencyWarnings: args.consistencyWarnings ?? []
+  };
+}
+
+function appendUploadedFiles(target: UploadedFileResult[], incoming: UploadedFileResult[]): void {
+  for (const entry of incoming) {
+    const alreadyPresent = target.some(
+      (current) =>
+        current.fieldLabel === entry.fieldLabel &&
+        current.classification === entry.classification &&
+        current.filePath === entry.filePath &&
+        current.required === entry.required &&
+        current.outcome === entry.outcome
+    );
+
+    if (!alreadyPresent) {
+      target.push(entry);
+    }
+  }
 }
 
 export async function applyToJob(args: {
@@ -262,6 +853,7 @@ export async function applyToJob(args: {
   profile: UserProfile;
   onEvent?: (level: "info" | "warn" | "error" | "success", message: string) => void;
   setStatus?: (status: ApplicationStatus | "starting" | "running", summary: string) => void;
+  updateRunState?: (patch: Partial<Pick<ActiveRunState, "phase" | "browserKeptOpen" | "reviewReason" | "consistencyWarnings" | "finalAction">>) => void;
 }): Promise<ApplicationResult> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === "your_gemini_api_key_here") {
@@ -271,9 +863,16 @@ export async function applyToJob(args: {
   const startedAt = Date.now();
   let screenshotPath: string | undefined;
   let stagehand: Stagehand | undefined;
+  let browserKeptOpen = false;
 
   try {
     args.setStatus?.("starting", "Launching browser session");
+    args.updateRunState?.({
+      phase: "starting",
+      browserKeptOpen: false,
+      consistencyWarnings: [],
+      finalAction: "none"
+    });
 
     stagehand = new Stagehand({
       env: "LOCAL",
@@ -294,13 +893,23 @@ export async function applyToJob(args: {
     });
 
     await stagehand.init();
-    const page = stagehand.context.pages()[0];
+    const page = stagehand.context.pages()[0] as unknown as AutomationPage;
+    const takeScreenshot = async () => {
+      const screenshotDir = path.resolve("./logs/screenshots");
+      fs.mkdirSync(screenshotDir, { recursive: true });
+      screenshotPath = path.join(screenshotDir, `${args.jobId}-${Date.now()}.png`);
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      args.onEvent?.("info", `Saved screenshot to ${screenshotPath}`);
+    };
+
+    args.updateRunState?.({ phase: "navigating" });
     args.onEvent?.("info", `Navigating to ${args.jobUrl}`);
     args.setStatus?.("running", "Navigating to application page");
     await page.goto(args.jobUrl);
     await page.waitForLoadState("domcontentloaded");
 
-    const iframeUrls = await discoverIframeUrls(page);
+    const iframeDiscoveryTimeoutMs = shouldUseExtendedIframeDiscovery(args.jobUrl) ? 8000 : 2000;
+    const iframeUrls = await discoverIframeUrls(page, iframeDiscoveryTimeoutMs);
     const targetUrl = resolveApplicationTargetUrl(args.jobUrl, iframeUrls);
     if (targetUrl !== args.jobUrl) {
       args.onEvent?.("info", `Navigating directly to embedded application: ${targetUrl}`);
@@ -316,24 +925,84 @@ export async function applyToJob(args: {
       }
     });
     const executionVariables = buildExecutionVariables(args.profile);
+    const uploadedFiles: UploadedFileResult[] = [];
 
-    const result = await runAgentWithRetry(agent, executionVariables, args.onEvent);
+    args.updateRunState?.({ phase: "uploading" });
+    args.onEvent?.("info", "Inspecting file inputs for direct uploads before fill phase");
+    let fileInputDescriptors: FileInputDescriptor[] = [];
+    try {
+      fileInputDescriptors = await listFileInputs(page);
+    } catch (error) {
+      args.onEvent?.("warn", `Failed to inspect file inputs: ${String(error)}`);
+      fileInputDescriptors = [];
+    }
+    const initialUploadPlan = planFileUploads(args.profile.settings, fileInputDescriptors);
+    const initialUploadPhase = await applyUploads(page, initialUploadPlan, args.onEvent);
+    appendUploadedFiles(uploadedFiles, initialUploadPhase.uploadedFiles);
+    let combinedWarnings = [...initialUploadPhase.consistencyWarnings];
+    if (combinedWarnings.length > 0) {
+      args.updateRunState?.({ consistencyWarnings: combinedWarnings });
+    }
 
-    if (result.success === false || result.completed === false) {
-      const classified = classifyAgentMessage(result.message || "Stagehand agent execution failed");
-      args.onEvent?.("warn", result.message || "Stagehand agent execution failed");
-      args.setStatus?.(classified.status, result.message || "Stagehand agent execution failed");
+    if (initialUploadPhase.blockers.length > 0) {
+      const reviewReason = initialUploadPhase.blockers.join("; ");
+      browserKeptOpen = shouldKeepBrowserOpen(args.profile.settings.keepBrowserOpenPolicy, "needs_review", "reviewed");
+      args.setStatus?.("needs_review", reviewReason);
+      args.updateRunState?.({
+        phase: "finished",
+        browserKeptOpen,
+        reviewReason,
+        finalAction: "reviewed",
+        consistencyWarnings: combinedWarnings
+      });
 
       if (args.profile.settings.screenshotOnComplete) {
-        const screenshotDir = path.resolve("./logs/screenshots");
-        fs.mkdirSync(screenshotDir, { recursive: true });
-        screenshotPath = path.join(screenshotDir, `${args.jobId}-${Date.now()}.png`);
-        await page.screenshot({ path: screenshotPath, fullPage: true });
-        args.onEvent?.("info", `Saved screenshot to ${screenshotPath}`);
+        await takeScreenshot();
       }
 
-      return {
-        timestamp: new Date().toISOString(),
+      return buildResult({
+        startedAt,
+        jobId: args.jobId,
+        jobUrl: args.jobUrl,
+        company: args.company,
+        jobTitle: args.jobTitle,
+        status: "needs_review",
+        resumeUploadRequired: /resume|cv/i.test(reviewReason),
+        notes: reviewReason,
+        screenshotPath,
+        finalAction: "reviewed",
+        browserKeptOpen,
+        reviewReason,
+        uploadedFiles,
+        consistencyWarnings: combinedWarnings
+      });
+    }
+
+    args.updateRunState?.({ phase: "filling" });
+    const fillPhase = await runAgentWithRetry(agent, page, executionVariables, args.onEvent);
+    combinedWarnings = [...combinedWarnings, ...fillPhase.consistencyWarnings];
+    if (combinedWarnings.length > 0) {
+      args.updateRunState?.({ consistencyWarnings: combinedWarnings });
+    }
+
+    const proceedToUploadAfterFillBlocker =
+      fillPhase.result.success === false &&
+      fillPhase.result.completed === false &&
+      classifyAgentMessage(fillPhase.result.message || "").status === "resume_upload_required";
+
+    if ((fillPhase.result.success === false || fillPhase.result.completed === false) && !proceedToUploadAfterFillBlocker) {
+      const classified = classifyAgentMessage(fillPhase.result.message || "Stagehand agent execution failed");
+      const finalAction: FinalAction = classified.status === "needs_review" ? "reviewed" : "none";
+      browserKeptOpen = shouldKeepBrowserOpen(args.profile.settings.keepBrowserOpenPolicy, classified.status, finalAction);
+      args.setStatus?.(classified.status, fillPhase.result.message || "Stagehand agent execution failed");
+      args.updateRunState?.({ phase: "finished", browserKeptOpen, finalAction });
+
+      if (args.profile.settings.screenshotOnComplete) {
+        await takeScreenshot();
+      }
+
+      return buildResult({
+        startedAt,
         jobId: args.jobId,
         jobUrl: args.jobUrl,
         company: args.company,
@@ -341,61 +1010,247 @@ export async function applyToJob(args: {
         status: classified.status,
         unknownFields: classified.unknownFields,
         resumeUploadRequired: classified.resumeUploadRequired,
-        notes: result.message || "Stagehand agent execution failed",
-        durationSeconds: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
-        screenshotPath
-      };
+        notes: fillPhase.result.message || "Stagehand agent execution failed",
+        screenshotPath,
+        finalAction,
+        browserKeptOpen,
+        uploadedFiles,
+        consistencyWarnings: combinedWarnings
+      });
     }
 
-    const structured = agentOutputSchema.parse(result.output ?? {});
-    const resultMessage = result.message || "";
-    const unknownFields = structured.unknownFields.length
-      ? structured.unknownFields
-      : parseUnknownFields(resultMessage);
-    const resumeUploadRequired = structured.resumeUploadRequired || resultMessage.includes("RESUME_UPLOAD_REQUIRED");
-    const status = normalizeStatus(structured.status, resumeUploadRequired);
+    const fillOutput: z.infer<typeof agentOutputSchema> =
+      fillPhase.result.success === false || fillPhase.result.completed === false
+        ? {
+            status: "completed",
+            notes: fillPhase.result.message || "Uploads need to be handled before finishing the application",
+            unknownFields: parseUnknownFields(fillPhase.result.message || ""),
+            resumeUploadRequired: true
+          }
+        : agentOutputSchema.parse(fillPhase.result.output ?? {});
+    const unknownFields = fillOutput.unknownFields.length
+      ? fillOutput.unknownFields
+      : parseUnknownFields(fillPhase.result.message || "");
 
-    args.onEvent?.("success", structured.notes);
-    args.setStatus?.(status, structured.notes);
+    if (!fillPhase.progressVerified && fillPhase.progressCheckReliable && agentClaimsAction(fillPhase.result)) {
+      browserKeptOpen = shouldKeepBrowserOpen(args.profile.settings.keepBrowserOpenPolicy, "failed", "none");
+      args.setStatus?.("failed", "Fill phase had no observable effect");
+      args.updateRunState?.({
+        phase: "finished",
+        browserKeptOpen,
+        consistencyWarnings: fillPhase.consistencyWarnings,
+        finalAction: "none"
+      });
+
+      if (args.profile.settings.screenshotOnComplete) {
+        await takeScreenshot();
+      }
+
+      return buildResult({
+        startedAt,
+        jobId: args.jobId,
+        jobUrl: args.jobUrl,
+        company: args.company,
+        jobTitle: args.jobTitle,
+        status: "failed",
+        unknownFields,
+        notes: "Fill phase reported actions without observable page progress",
+        screenshotPath,
+        finalAction: "none",
+        browserKeptOpen,
+        uploadedFiles,
+        consistencyWarnings: combinedWarnings
+      });
+    }
+
+    if (proceedToUploadAfterFillBlocker) {
+      args.updateRunState?.({ phase: "uploading" });
+      args.onEvent?.("info", "Fill phase hit a file-upload blocker; attempting direct file uploads");
+      let uploadFileInputDescriptors: FileInputDescriptor[] = [];
+      try {
+        uploadFileInputDescriptors = await listFileInputs(page);
+      } catch (error) {
+        args.onEvent?.("warn", `Failed to re-inspect file inputs after fill phase: ${String(error)}`);
+        uploadFileInputDescriptors = [];
+      }
+      const uploadPlan = planFileUploads(args.profile.settings, uploadFileInputDescriptors);
+      const uploadPhase = await applyUploads(page, uploadPlan, args.onEvent);
+      appendUploadedFiles(uploadedFiles, uploadPhase.uploadedFiles);
+      combinedWarnings = [...combinedWarnings, ...uploadPhase.consistencyWarnings];
+      if (combinedWarnings.length > 0) {
+        args.updateRunState?.({ consistencyWarnings: combinedWarnings });
+      }
+
+      if (uploadPhase.blockers.length > 0) {
+        const reviewReason = uploadPhase.blockers.join("; ");
+        browserKeptOpen = shouldKeepBrowserOpen(args.profile.settings.keepBrowserOpenPolicy, "needs_review", "reviewed");
+        args.setStatus?.("needs_review", reviewReason);
+        args.updateRunState?.({
+          phase: "finished",
+          browserKeptOpen,
+          reviewReason,
+          finalAction: "reviewed",
+          consistencyWarnings: combinedWarnings
+        });
+
+        if (args.profile.settings.screenshotOnComplete) {
+          await takeScreenshot();
+        }
+
+        return buildResult({
+          startedAt,
+          jobId: args.jobId,
+          jobUrl: args.jobUrl,
+          company: args.company,
+          jobTitle: args.jobTitle,
+          status: "needs_review",
+          unknownFields,
+          resumeUploadRequired: /resume|cv/i.test(reviewReason),
+          notes: reviewReason,
+          screenshotPath,
+          finalAction: "reviewed",
+          browserKeptOpen,
+          reviewReason,
+          uploadedFiles,
+          consistencyWarnings: combinedWarnings
+        });
+      }
+    }
+
+    if (args.profile.settings.submissionMode === "review_before_submit") {
+      const status = normalizeStatus(fillOutput.status, false);
+      const notes = fillOutput.notes || fillPhase.result.message || "Ready for review before submit";
+      browserKeptOpen = shouldKeepBrowserOpen(args.profile.settings.keepBrowserOpenPolicy, status, "reviewed");
+      args.setStatus?.(status, notes);
+      args.updateRunState?.({
+        phase: "finished",
+        browserKeptOpen,
+        finalAction: "reviewed",
+        consistencyWarnings: combinedWarnings
+      });
+
+      if (args.profile.settings.screenshotOnComplete) {
+        await takeScreenshot();
+      }
+
+      return buildResult({
+        startedAt,
+        jobId: args.jobId,
+        jobUrl: args.jobUrl,
+        company: args.company,
+        jobTitle: args.jobTitle,
+        status,
+        unknownFields,
+        notes,
+        screenshotPath,
+        finalAction: "reviewed",
+        browserKeptOpen,
+        uploadedFiles,
+        consistencyWarnings: combinedWarnings
+      });
+    }
+
+    args.updateRunState?.({ phase: "finalizing" });
+    const submitPhase = await runSubmitPhase(agent, page, executionVariables, args.onEvent);
+    const allWarnings = [...combinedWarnings, ...submitPhase.consistencyWarnings];
+    const submitNoProgressFailure =
+      !submitPhase.progressVerified && submitPhase.progressCheckReliable && agentClaimsAction(submitPhase.result);
+
+    if (submitPhase.result.success === false || submitPhase.result.completed === false || submitNoProgressFailure) {
+      const reviewReason = submitNoProgressFailure
+        ? "Submit phase reported actions without an observable completion change"
+        : submitPhase.result.message || "Submit phase failed";
+      const status = submitNoProgressFailure
+        ? "failed"
+        : classifyAgentMessage(submitPhase.result.message || "Submit phase failed").status;
+      const finalAction: FinalAction = status === "needs_review" ? "reviewed" : "none";
+      browserKeptOpen = shouldKeepBrowserOpen(args.profile.settings.keepBrowserOpenPolicy, status, finalAction);
+      args.setStatus?.(status, reviewReason);
+      args.updateRunState?.({
+        phase: "finished",
+        browserKeptOpen,
+        reviewReason,
+        finalAction,
+        consistencyWarnings: allWarnings
+      });
+
+      if (args.profile.settings.screenshotOnComplete) {
+        await takeScreenshot();
+      }
+
+      return buildResult({
+        startedAt,
+        jobId: args.jobId,
+        jobUrl: args.jobUrl,
+        company: args.company,
+        jobTitle: args.jobTitle,
+        status,
+        unknownFields,
+        notes: reviewReason,
+        screenshotPath,
+        finalAction,
+        browserKeptOpen,
+        reviewReason,
+        uploadedFiles,
+        consistencyWarnings: allWarnings
+      });
+    }
+
+    const submitOutput = agentOutputSchema.parse(submitPhase.result.output ?? {});
+    const submittedStatus = normalizeStatus(submitOutput.status, false);
+    const submitNotes = submitOutput.notes || submitPhase.result.message || "Application submitted";
+    browserKeptOpen = shouldKeepBrowserOpen(args.profile.settings.keepBrowserOpenPolicy, submittedStatus, "submitted");
+    args.setStatus?.(submittedStatus, submitNotes);
+    args.updateRunState?.({
+      phase: "finished",
+      browserKeptOpen,
+      finalAction: "submitted",
+      consistencyWarnings: allWarnings
+    });
 
     if (args.profile.settings.screenshotOnComplete) {
-      const screenshotDir = path.resolve("./logs/screenshots");
-      fs.mkdirSync(screenshotDir, { recursive: true });
-      screenshotPath = path.join(screenshotDir, `${args.jobId}-${Date.now()}.png`);
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      args.onEvent?.("info", `Saved screenshot to ${screenshotPath}`);
+      await takeScreenshot();
     }
 
-    return {
-      timestamp: new Date().toISOString(),
+    return buildResult({
+      startedAt,
       jobId: args.jobId,
       jobUrl: args.jobUrl,
       company: args.company,
       jobTitle: args.jobTitle,
-      status,
+      status: submittedStatus,
       unknownFields,
-      resumeUploadRequired,
-      notes: structured.notes || resultMessage || "Run finished",
-      durationSeconds: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
-      screenshotPath
-    };
+      notes: submitNotes,
+      screenshotPath,
+      finalAction: "submitted",
+      browserKeptOpen,
+      uploadedFiles,
+      consistencyWarnings: allWarnings
+    });
   } catch (error) {
     args.onEvent?.("error", String(error));
     args.setStatus?.("failed", "Run failed");
-    return {
-      timestamp: new Date().toISOString(),
+    browserKeptOpen = shouldKeepBrowserOpen(args.profile.settings.keepBrowserOpenPolicy, "failed", "none");
+    args.updateRunState?.({
+      phase: "finished",
+      browserKeptOpen,
+      finalAction: "none"
+    });
+    return buildResult({
+      startedAt,
       jobId: args.jobId,
       jobUrl: args.jobUrl,
       company: args.company,
       jobTitle: args.jobTitle,
       status: "failed",
-      unknownFields: [],
-      resumeUploadRequired: false,
       notes: `Error: ${String(error)}`,
-      durationSeconds: Math.max(1, Math.round((Date.now() - startedAt) / 1000)),
-      screenshotPath
-    };
+      screenshotPath,
+      finalAction: "none",
+      browserKeptOpen
+    });
   } finally {
-    await stagehand?.close().catch(() => undefined);
+    if (!browserKeptOpen) {
+      await stagehand?.close().catch(() => undefined);
+    }
   }
 }

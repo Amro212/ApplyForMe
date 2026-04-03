@@ -48,6 +48,63 @@ describe("profile and jobs storage", () => {
     expect(fs.existsSync(process.env.PROFILE_PATH!)).toBe(true);
   });
 
+  it("migrates legacy stopBeforeSubmit settings into the new submission controls", async () => {
+    const { loadProfile } = await import("../src/profile/storage.js");
+
+    fs.mkdirSync(path.dirname(process.env.PROFILE_PATH!), { recursive: true });
+    fs.writeFileSync(
+      process.env.PROFILE_PATH!,
+      JSON.stringify({
+        personal: {
+          firstName: "Ada",
+          lastName: "Lovelace",
+          fullName: "Ada Lovelace",
+          email: "ada@example.com",
+          phone: "+1 555 0100",
+          address: "",
+          city: "",
+          province: "",
+          country: "Canada",
+          postalCode: "",
+          linkedin: "https://linkedin.com/in/ada",
+          github: "",
+          portfolio: "",
+          preferredName: "Ada"
+        },
+        workAuthorization: [{ country: "Canada", authorized: true, requiresSponsorship: false }],
+        preferences: {
+          jobTypes: ["full-time"],
+          earliestStartDate: "",
+          willingToRelocate: false,
+          remotePreference: "no preference"
+        },
+        education: [],
+        experience: [],
+        skills: [],
+        languages: [{ language: "English", proficiency: "fluent" }],
+        references: [],
+        demographic: {
+          gender: "Female"
+        },
+        settings: {
+          coverLetterStyle: "formal",
+          resumePath: "./resumes/resume.pdf",
+          defaultAnswerForUnknown: "leave blank",
+          stopBeforeSubmit: false,
+          screenshotOnComplete: true
+        }
+      }),
+      "utf-8"
+    );
+
+    expect(loadProfile().settings).toMatchObject({
+      submissionMode: "auto_submit",
+      keepBrowserOpenPolicy: "failures_and_review",
+      coverLetterPath: "",
+      attachmentMappings: []
+    });
+  });
+
   it("saves and reloads saved jobs", async () => {
     const { loadJobs, saveJobs } = await import("../src/jobs/storage.js");
     const jobs = [

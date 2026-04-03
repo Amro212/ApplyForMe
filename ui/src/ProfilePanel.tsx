@@ -575,6 +575,13 @@ export function ProfilePanel(props: ProfilePanelProps) {
           <Field label="Resume file path">
             <input value={profile.settings.resumePath} onChange={(event) => setProfile((current) => ({ ...current, settings: { ...current.settings, resumePath: event.target.value } }))} />
           </Field>
+          <Field label="Cover letter file path">
+            <input
+              id="settings.coverLetterPath"
+              value={profile.settings.coverLetterPath}
+              onChange={(event) => setProfile((current) => ({ ...current, settings: { ...current.settings, coverLetterPath: event.target.value } }))}
+            />
+          </Field>
           <Field label="Default unknown answer">
             <select
               value={profile.settings.defaultAnswerForUnknown}
@@ -589,16 +596,62 @@ export function ProfilePanel(props: ProfilePanelProps) {
               <option value="prefer not to say">prefer not to say</option>
             </select>
           </Field>
+          <Field label="Browser after run">
+            <select
+              value={profile.settings.keepBrowserOpenPolicy}
+              onChange={(event) =>
+                setProfile((current) => ({
+                  ...current,
+                  settings: {
+                    ...current.settings,
+                    keepBrowserOpenPolicy: event.target.value as UserProfile["settings"]["keepBrowserOpenPolicy"]
+                  }
+                }))
+              }
+            >
+              <option value="never">never</option>
+              <option value="failures_and_review">failures_and_review</option>
+              <option value="always">always</option>
+            </select>
+          </Field>
         </div>
         <div className="checkbox-grid">
           <label className="checkbox">
             <input
-              type="checkbox"
-              checked={profile.settings.stopBeforeSubmit}
-              onChange={(event) => setProfile((current) => ({ ...current, settings: { ...current.settings, stopBeforeSubmit: event.target.checked } }))}
+              type="radio"
+              name="submissionMode"
+              checked={profile.settings.submissionMode === "review_before_submit"}
+              onChange={() =>
+                setProfile((current) => ({
+                  ...current,
+                  settings: {
+                    ...current.settings,
+                    submissionMode: "review_before_submit"
+                  }
+                }))
+              }
             />
-            Stop before submit
+            Review before submit
           </label>
+          <label className="checkbox">
+            <input
+              type="radio"
+              name="submissionMode"
+              checked={profile.settings.submissionMode === "auto_submit"}
+              onChange={() =>
+                setProfile((current) => ({
+                  ...current,
+                  settings: {
+                    ...current.settings,
+                    submissionMode: "auto_submit"
+                  }
+                }))
+              }
+            />
+            Auto submit when safe
+          </label>
+        </div>
+        <div className="checkbox-grid">
           <label className="checkbox">
             <input
               type="checkbox"
@@ -607,6 +660,65 @@ export function ProfilePanel(props: ProfilePanelProps) {
             />
             Screenshot on completion
           </label>
+        </div>
+        <div className="stack">
+          {(profile.settings.attachmentMappings ?? []).map((mapping, index) => (
+            <div className="section-grid" key={mapping.id}>
+              <Field label={`Attachment label match ${index + 1}`}>
+                <input
+                  value={mapping.labelContains}
+                  onChange={(event) =>
+                    setProfile((current) => ({
+                      ...current,
+                      settings: {
+                        ...current.settings,
+                        attachmentMappings: updateArrayItem(current.settings.attachmentMappings, index, {
+                          ...mapping,
+                          labelContains: event.target.value
+                        })
+                      }
+                    }))
+                  }
+                />
+              </Field>
+              <Field label={`Attachment file path ${index + 1}`}>
+                <input
+                  value={mapping.filePath}
+                  onChange={(event) =>
+                    setProfile((current) => ({
+                      ...current,
+                      settings: {
+                        ...current.settings,
+                        attachmentMappings: updateArrayItem(current.settings.attachmentMappings, index, {
+                          ...mapping,
+                          filePath: event.target.value
+                        })
+                      }
+                    }))
+                  }
+                />
+              </Field>
+            </div>
+          ))}
+          <button
+            className="button"
+            type="button"
+            onClick={() =>
+              setProfile((current) => ({
+                ...current,
+                settings: {
+                  ...current.settings,
+                  attachmentMappings: pushItem(current.settings.attachmentMappings, {
+                    id: `attachment_${current.settings.attachmentMappings.length + 1}`,
+                    labelContains: "",
+                    filePath: ""
+                  })
+                }
+              }))
+            }
+          >
+            Add attachment mapping
+          </button>
         </div>
       </SectionCard>
     </div>

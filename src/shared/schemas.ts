@@ -40,6 +40,12 @@ export const referenceSchema = z.object({
   relationship: z.string()
 });
 
+export const attachmentMappingSchema = z.object({
+  id: z.string().min(1),
+  labelContains: z.string().min(1),
+  filePath: z.string().min(1)
+});
+
 export const userProfileSchema = z.object({
   personal: z.object({
     firstName: z.string().min(1),
@@ -90,8 +96,11 @@ export const userProfileSchema = z.object({
   settings: z.object({
     coverLetterStyle: z.enum(["formal", "conversational", "technical"]),
     resumePath: z.string(),
+    coverLetterPath: z.string(),
+    attachmentMappings: z.array(attachmentMappingSchema),
+    submissionMode: z.enum(["review_before_submit", "auto_submit"]),
+    keepBrowserOpenPolicy: z.enum(["never", "failures_and_review", "always"]),
     defaultAnswerForUnknown: z.enum(["leave blank", "prefer not to say"]),
-    stopBeforeSubmit: z.boolean(),
     screenshotOnComplete: z.boolean()
   })
 });

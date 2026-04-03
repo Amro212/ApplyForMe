@@ -53,8 +53,11 @@ export const defaultProfile: UserProfile = {
   settings: {
     coverLetterStyle: "formal",
     resumePath: "./resumes/resume.pdf",
+    coverLetterPath: "",
+    attachmentMappings: [],
+    submissionMode: "auto_submit",
+    keepBrowserOpenPolicy: "failures_and_review",
     defaultAnswerForUnknown: "leave blank",
-    stopBeforeSubmit: true,
     screenshotOnComplete: true
   }
 };

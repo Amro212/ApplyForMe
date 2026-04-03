@@ -17,6 +17,13 @@ export function RunsPanel(props: RunsPanelProps) {
               <span className="pill">{props.activeRun.status}</span>
             </div>
             <p>{props.activeRun.summary}</p>
+            <div>Phase: {props.activeRun.phase}</div>
+            <div>Final action: {props.activeRun.finalAction}</div>
+            {props.activeRun.reviewReason ? <div>Review reason: {props.activeRun.reviewReason}</div> : null}
+            {props.activeRun.browserKeptOpen ? <div>Browser left open for review.</div> : null}
+            {props.activeRun.consistencyWarnings.length > 0 ? (
+              <div>Consistency warnings: {props.activeRun.consistencyWarnings.join(", ")}</div>
+            ) : null}
             <div className="event-list">
               {props.activeRun.events.map((event) => (
                 <div className="event" key={event.id}>
@@ -45,6 +52,18 @@ export function RunsPanel(props: RunsPanelProps) {
                 </div>
                 <div className="muted">{entry.jobUrl}</div>
                 <div>{entry.notes}</div>
+                <div>Final action: {entry.finalAction}</div>
+                {entry.reviewReason ? <div>Review reason: {entry.reviewReason}</div> : null}
+                {entry.browserKeptOpen ? <div>Browser left open for review.</div> : null}
+                {entry.uploadedFiles.length > 0 ? (
+                  <div>
+                    Uploads:{" "}
+                    {entry.uploadedFiles
+                      .map((upload) => `${upload.fieldLabel} (${upload.classification}, ${upload.outcome})`)
+                      .join(", ")}
+                  </div>
+                ) : null}
+                {entry.consistencyWarnings.length > 0 ? <div>Consistency warnings: {entry.consistencyWarnings.join(", ")}</div> : null}
                 {entry.unknownFields.length > 0 ? <div>Unknown fields: {entry.unknownFields.join(", ")}</div> : null}
                 {entry.screenshotPath ? <div>Screenshot: {entry.screenshotPath}</div> : null}
               </article>

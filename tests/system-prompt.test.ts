@@ -16,6 +16,10 @@ describe("buildSystemPrompt", () => {
       settings: {
         ...defaultProfile.settings,
         coverLetterStyle: "technical",
+        coverLetterPath: "./resumes/cover-letter.pdf",
+        submissionMode: "auto_submit",
+        keepBrowserOpenPolicy: "always",
+        attachmentMappings: [{ id: "portfolio", labelContains: "portfolio", filePath: "./resumes/portfolio.pdf" }],
         defaultAnswerForUnknown: "prefer not to say"
       }
     });
@@ -29,5 +33,7 @@ describe("buildSystemPrompt", () => {
     expect(prompt).toContain("APPLICATION SETTINGS:");
     expect(prompt).toContain("- Cover letter style: technical");
     expect(prompt).toContain("- Default answer for unknown fields: prefer not to say");
+    expect(prompt).toContain("- Submission mode: auto_submit");
+    expect(prompt).toContain("- Keep browser open policy: always");
   });
 });

@@ -29,7 +29,12 @@ describe("logResult", () => {
       unknownFields: ["Visa status"],
       resumeUploadRequired: true,
       notes: "Manual follow-up needed",
-      durationSeconds: 12
+      durationSeconds: 12,
+      finalAction: "reviewed",
+      browserKeptOpen: true,
+      reviewReason: "Manual follow-up needed",
+      uploadedFiles: [],
+      consistencyWarnings: []
     });
 
     logResult({
@@ -42,7 +47,11 @@ describe("logResult", () => {
       unknownFields: [],
       resumeUploadRequired: false,
       notes: "Stopped at submit",
-      durationSeconds: 30
+      durationSeconds: 30,
+      finalAction: "submitted",
+      browserKeptOpen: false,
+      uploadedFiles: [],
+      consistencyWarnings: []
     });
 
     const parsed = JSON.parse(fs.readFileSync(process.env.LOG_PATH!, "utf-8")) as Array<{ jobId: string }>;

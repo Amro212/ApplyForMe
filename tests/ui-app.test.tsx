@@ -54,8 +54,11 @@ const profilePayload = {
   settings: {
     coverLetterStyle: "formal",
     resumePath: "./resumes/resume.pdf",
+    coverLetterPath: "",
+    attachmentMappings: [],
+    submissionMode: "review_before_submit",
+    keepBrowserOpenPolicy: "failures_and_review",
     defaultAnswerForUnknown: "leave blank",
-    stopBeforeSubmit: true,
     screenshotOnComplete: true
   }
 };
@@ -203,6 +206,20 @@ describe("App", () => {
     fireEvent.change(demographicSection.getByLabelText(/pronouns/i), {
       target: { value: "he/him" }
     });
+    fireEvent.change(settingsSection.getByLabelText(/cover letter file path/i), {
+      target: { value: "./resumes/cover-letter.pdf" }
+    });
+    fireEvent.click(settingsSection.getByLabelText(/auto submit when safe/i));
+    fireEvent.change(settingsSection.getByLabelText(/browser after run/i), {
+      target: { value: "always" }
+    });
+    fireEvent.click(settingsSection.getByRole("button", { name: /add attachment mapping/i }));
+    fireEvent.change(settingsSection.getByLabelText(/attachment label match 1/i), {
+      target: { value: "portfolio" }
+    });
+    fireEvent.change(settingsSection.getByLabelText(/attachment file path 1/i), {
+      target: { value: "./resumes/portfolio.pdf" }
+    });
     fireEvent.click(settingsSection.getByLabelText(/screenshot on completion/i));
     fireEvent.click(screen.getAllByRole("button", { name: /save profile/i })[0]);
 
@@ -226,6 +243,12 @@ describe("App", () => {
     expect(postedProfile.preferences.relocationCities).toEqual(["Toronto", "Vancouver"]);
     expect(postedProfile.demographic.gender).toBe("Male");
     expect(postedProfile.demographic.pronouns).toBe("he/him");
+    expect(postedProfile.settings.coverLetterPath).toBe("./resumes/cover-letter.pdf");
+    expect(postedProfile.settings.submissionMode).toBe("auto_submit");
+    expect(postedProfile.settings.keepBrowserOpenPolicy).toBe("always");
+    expect(postedProfile.settings.attachmentMappings).toEqual([
+      expect.objectContaining({ labelContains: "portfolio", filePath: "./resumes/portfolio.pdf" })
+    ]);
     expect(postedProfile.settings.screenshotOnComplete).toBe(false);
   });
 });

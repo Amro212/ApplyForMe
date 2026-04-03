@@ -23,7 +23,11 @@ async function startTestServer() {
         unknownFields: [],
         resumeUploadRequired: false,
         notes: "Stopped before submit",
-        durationSeconds: 1
+        durationSeconds: 1,
+        finalAction: "reviewed",
+        browserKeptOpen: false,
+        uploadedFiles: [],
+        consistencyWarnings: []
       };
     }
   });
@@ -221,8 +225,11 @@ describe("server API", () => {
         settings: {
           coverLetterStyle: "technical",
           resumePath: "./resumes/custom.pdf",
+          coverLetterPath: "./resumes/cover-letter.pdf",
+          attachmentMappings: [{ id: "portfolio", labelContains: "portfolio", filePath: "./resumes/portfolio.pdf" }],
+          submissionMode: "auto_submit",
+          keepBrowserOpenPolicy: "always",
           defaultAnswerForUnknown: "prefer not to say",
-          stopBeforeSubmit: false,
           screenshotOnComplete: false
         }
       };

@@ -23,11 +23,18 @@ interface CreateAppOptions {
         job: SavedJob;
         onEvent: (level: "info" | "warn" | "error" | "success", message: string) => void;
         setStatus: (status: "starting" | "running" | ApplicationResult["status"], summary: string) => void;
+        updateRunState: (patch: {
+          phase?: import("../shared/types.js").RunPhase;
+          browserKeptOpen?: boolean;
+          reviewReason?: string;
+          consistencyWarnings?: string[];
+          finalAction?: import("../shared/types.js").FinalAction;
+        }) => void;
       }) => Promise<ApplicationResult>;
 }
 
 function buildDefaultRunJob(): NonNullable<CreateAppOptions["runJob"]> {
-  return async ({ job, onEvent, setStatus }) => {
+  return async ({ job, onEvent, setStatus, updateRunState }) => {
     const result = await applyToJob({
       jobId: job.id,
       jobUrl: job.jobUrl,
@@ -35,7 +42,8 @@ function buildDefaultRunJob(): NonNullable<CreateAppOptions["runJob"]> {
       jobTitle: job.jobTitle,
       profile: loadProfile(),
       onEvent,
-      setStatus
+      setStatus,
+      updateRunState
     });
 
     logResult(result);

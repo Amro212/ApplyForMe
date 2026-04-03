@@ -126,7 +126,14 @@ APPLICATION SETTINGS:
 - Cover letter style: ${profile.settings.coverLetterStyle}
 - Default answer for unknown fields: ${profile.settings.defaultAnswerForUnknown}
 - Resume path: ${profile.settings.resumePath}
-- Stop before submit: ${profile.settings.stopBeforeSubmit ? "Yes" : "No"}
+- Cover letter path: ${profile.settings.coverLetterPath || "Not configured"}
+- Submission mode: ${profile.settings.submissionMode}
+- Keep browser open policy: ${profile.settings.keepBrowserOpenPolicy}
+- Attachment mappings: ${
+          profile.settings.attachmentMappings.length > 0
+            ? profile.settings.attachmentMappings.map((entry) => `${entry.labelContains} -> ${entry.filePath}`).join("; ")
+            : "None configured"
+        }
 - Screenshot on completion: ${profile.settings.screenshotOnComplete ? "Yes" : "No"}
 
 === FORM-FILLING RULES ===
@@ -145,7 +152,7 @@ ALWAYS:
 11. For unknown fields, follow the configured default answer policy: ${profile.settings.defaultAnswerForUnknown}.
 
 NEVER:
-- Do NOT click any Submit, Apply, or Send Application button.
+- Do NOT click any Submit, Apply, or Send Application button unless the run enters a dedicated submit phase explicitly.
 - Do NOT fabricate employment history, skills, or credentials not in this profile.
 - Do NOT guess on required factual fields that are not in the profile or safe defaults.
 - Do NOT fill CAPTCHA challenges; stop and report them immediately.
@@ -171,9 +178,8 @@ If you encounter a free-form prompt:
 - Do not fabricate specific numbers, projects, or facts not in the profile.
 
 RESUME UPLOAD FIELDS:
-- If you encounter a file upload field for a resume/CV, do not attempt to upload.
-- Report it as: RESUME_UPLOAD_REQUIRED: [field label]
-- The upload will be handled separately by the automation script.
+- File uploads are handled separately by the automation script.
+- Do not attempt to upload resume, cover letter, or other attachments yourself.
 
 ${safeDefaultsPromptSection}
 `.trim();

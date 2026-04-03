@@ -23,7 +23,11 @@ describe("RunManager", () => {
           unknownFields: [],
           resumeUploadRequired: false,
           notes: "Stopped before submit",
-          durationSeconds: 5
+          durationSeconds: 5,
+          finalAction: "reviewed",
+          browserKeptOpen: false,
+          uploadedFiles: [],
+          consistencyWarnings: []
         };
       },
       onEvent: (event) => {
