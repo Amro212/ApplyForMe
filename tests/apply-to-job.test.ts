@@ -488,6 +488,69 @@ describe("applyToJob", () => {
     ]);
   });
 
+  it("treats upload as successful when widget shows the filename even after file input state is cleared", async () => {
+    pageEvaluate.mockImplementation(async (_fn, arg) => {
+      const mode = (arg as { mode?: string } | undefined)?.mode;
+      if (mode === "iframe-urls") {
+        return [];
+      }
+      if (mode === "file-inputs") {
+        return [
+          {
+            index: 0,
+            label: "Resume / CV",
+            required: true,
+            descriptors: ["resume", "curriculum vitae"]
+          }
+        ];
+      }
+      if (mode === "inspect-upload") {
+        return {
+          selectedCount: 0,
+          selectedName: "",
+          uploadErrorText: "Cannot read properties of undefined (reading 'uploadFile')",
+          hasFilenameText: true,
+          matchedFileName: "my_resume.pdf",
+          uploadContainerPreview: "Resume/CV My_resume.pdf"
+        };
+      }
+      if (mode === "form-progress") {
+        return { nonFileControlCount: 3, completedValueCount: 2 };
+      }
+      return [];
+    });
+    locatorCount.mockResolvedValue(1);
+
+    const { applyToJob } = await import("../src/agent/applyToJob.js");
+
+    const result = await applyToJob({
+      jobId: "job_upload_widget_filename",
+      jobUrl: "https://example.com/jobs/upload-widget",
+      company: "Upload Co",
+      jobTitle: "Engineer",
+      profile: {
+        ...defaultProfile,
+        settings: {
+          ...defaultProfile.settings,
+          submissionMode: "review_before_submit",
+          keepBrowserOpenPolicy: "never",
+          resumePath: "C:\\docs\\My_resume.pdf",
+          coverLetterPath: "",
+          attachmentMappings: []
+        }
+      }
+    });
+
+    expect(locatorSetInputFiles).toHaveBeenCalledWith("C:\\docs\\My_resume.pdf");
+    expect(result.status).toBe("completed");
+    expect(result.uploadedFiles).toEqual([
+      expect.objectContaining({ classification: "resume", outcome: "uploaded" })
+    ]);
+    expect(result.consistencyWarnings).toEqual(
+      expect.arrayContaining([expect.stringContaining("Upload widget displayed an error")])
+    );
+  });
+
   it("runs file attachment inspection before the first Stagehand fill execution", async () => {
     const callOrder: string[] = [];
     pageEvaluate.mockImplementation(async (_fn, arg) => {

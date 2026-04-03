@@ -69,6 +69,8 @@ interface FileInputDescriptor {
   label: string;
   required: boolean;
   descriptors: string[];
+  domId?: string;
+  domName?: string;
 }
 
 interface PlannedUpload {
@@ -77,6 +79,8 @@ interface PlannedUpload {
   classification: UploadedFileResult["classification"];
   filePath: string;
   required: boolean;
+  domId?: string;
+  domName?: string;
 }
 
 interface UploadPlan {
@@ -90,6 +94,26 @@ interface FormProgressSnapshot {
   iframeCount: number;
   url: string;
   title: string;
+}
+
+type UploadDebugLog = (step: string, details?: Record<string, unknown>) => void;
+
+function createUploadDebugLogger(jobId: string): { logPath: string; log: UploadDebugLog } {
+  const logDir = path.resolve("./logs");
+  fs.mkdirSync(logDir, { recursive: true });
+  const logPath = path.join(logDir, `upload-debug-${jobId}-${Date.now()}.log`);
+
+  const log: UploadDebugLog = (step, details = {}) => {
+    const line = JSON.stringify({
+      timestamp: new Date().toISOString(),
+      step,
+      details
+    });
+    fs.appendFileSync(logPath, `${line}\n`, "utf8");
+  };
+
+  log("debug_logger_initialized", { jobId, logPath });
+  return { logPath, log };
 }
 
 function getAgentExecutionTimeoutMs(): number {
@@ -448,7 +472,9 @@ export function planFileUploads(
         label: descriptor.label,
         classification: "resume",
         filePath: settings.resumePath,
-        required: descriptor.required
+        required: descriptor.required,
+        domId: descriptor.domId,
+        domName: descriptor.domName
       });
     }
 
@@ -458,7 +484,9 @@ export function planFileUploads(
         label: descriptor.label,
         classification: "cover_letter",
         filePath: settings.coverLetterPath,
-        required: descriptor.required
+        required: descriptor.required,
+        domId: descriptor.domId,
+        domName: descriptor.domName
       });
     }
 
@@ -474,7 +502,9 @@ export function planFileUploads(
           label: descriptor.label,
           classification: "attachment",
           filePath: mapping.filePath,
-          required: descriptor.required
+          required: descriptor.required,
+          domId: descriptor.domId,
+          domName: descriptor.domName
         });
       }
     }
@@ -503,84 +533,22 @@ async function listFileInputs(page: AutomationPage): Promise<FileInputDescriptor
       void payload;
       try {
         const fileInputs: FileInputDescriptor[] = [];
-        
-        // Find all file input elements (including hidden ones)
         const inputs = document.querySelectorAll("input[type='file']");
         
         inputs.forEach((element, index) => {
           try {
             const input = element as HTMLInputElement;
-            const parent = input.parentElement;
-            const grandparent = parent?.parentElement;
-            const parentClasses = parent?.className || "";
-            const parentId = parent?.id || "";
-            const grandparentClasses = grandparent?.className || "";
-            const inputId = input.id || "";
-            const inputName = input.name || "";
-            const ariaLabel = input.getAttribute("aria-label") || "";
-            const dataTestId = input.getAttribute("data-testid") || "";
+            const label = input.getAttribute("aria-label") || input.name || input.id || `File field ${index + 1}`;
+            const ariaDescribedBy = input.getAttribute("aria-describedby") || "";
             const accept = input.getAttribute("accept") || "";
             const required = input.required === true;
-            const style = input.getAttribute("style") || "";
-            const displayValue = window.getComputedStyle(input).display;
-            
-            // Look for associated labels by various methods
-            let label = ariaLabel || inputId || inputName;
-            
-            // Try to find label by for attribute
-            if (!label && inputId) {
-              const associatedLabel = document.querySelector(`label[for="${inputId}"]`);
-              if (associatedLabel?.textContent) {
-                label = associatedLabel.textContent.trim();
-              }
-            }
-            
-            // Look for parent container text content (could be from Greenhouse's wrapper)
-            if (!label && parent) {
-              const text = parent.textContent?.trim() || "";
-              if (text && text.length < 200) {
-                label = text.substring(0, 100);
-              }
-            }
-            
-            // Look for grandparent text (containers)
-            if (!label && grandparent) {
-              const text = grandparent.textContent?.trim() || "";
-              if (text && text.length < 200) {
-                label = text.substring(0, 100);
-              }
-            }
-            
-            // Look for sibling labels
-            if (!label) {
-              const prevElement = input.previousElementSibling;
-              if (prevElement?.textContent) {
-                label = prevElement.textContent.trim();
-              }
-            }
-            
-            // Look for following button text (common pattern)
-            if (!label) {
-              const nextButton = input.nextElementSibling;
-              if (nextButton?.textContent) {
-                label = nextButton.textContent.trim();
-              }
-            }
-            
-            label = label || `File field ${index + 1}`;
 
             const descriptors = [
               label,
-              ariaLabel,
-              inputName,
-              inputId,
-              dataTestId,
-              parentClasses,
-              parentId,
-              grandparentClasses,
+              ariaDescribedBy,
               accept
             ]
-              .filter((s) => String(s).trim().length > 0)
+              .filter((s) => s.trim().length > 0)
               .join(" ")
               .toLowerCase()
               .split(/[^a-z0-9]+/)
@@ -588,9 +556,11 @@ async function listFileInputs(page: AutomationPage): Promise<FileInputDescriptor
 
             fileInputs.push({
               index,
-              label: `${label} [${displayValue === "none" ? "hidden" : "visible"}]`,
+              label,
               required,
-              descriptors
+              descriptors,
+              domId: input.id || undefined,
+              domName: input.name || undefined
             });
           } catch {
             // Skip elements that fail to process
@@ -606,52 +576,234 @@ async function listFileInputs(page: AutomationPage): Promise<FileInputDescriptor
   );
 }
 
+async function inspectUploadResult(
+  page: AutomationPage,
+  index: number,
+  expectedFileName?: string,
+  domId?: string,
+  domName?: string
+): Promise<{
+  selectedCount: number;
+  selectedName: string;
+  uploadErrorText: string | null;
+  hasFilenameText: boolean;
+  matchedFileName: string | null;
+  uploadContainerPreview: string;
+}> {
+  const inspected = await page
+    .evaluate(
+      (payload: {
+        mode: "inspect-upload";
+        index: number;
+        expectedFileName?: string;
+        domId?: string;
+        domName?: string;
+      }) => {
+        const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+        const input =
+          inputs.find((candidate) => payload.domId && (candidate as HTMLInputElement).id === payload.domId) ??
+          inputs.find((candidate) => payload.domName && (candidate as HTMLInputElement).name === payload.domName) ??
+          (inputs[payload.index] as HTMLInputElement | undefined);
+        const documentTextLower = (document.body?.textContent || "").toLowerCase();
+        const normalizedExpectedName = (payload.expectedFileName || "").trim().toLowerCase();
+
+        if (!input) {
+          const hasDocumentFilenameText =
+            normalizedExpectedName.length > 0 && documentTextLower.includes(normalizedExpectedName);
+          return {
+            selectedCount: 0,
+            selectedName: "",
+            uploadErrorText: null,
+            hasFilenameText: hasDocumentFilenameText,
+            matchedFileName: hasDocumentFilenameText ? normalizedExpectedName : null,
+            uploadContainerPreview: ""
+          };
+        }
+
+        const selectedCount = input.files?.length ?? 0;
+        const selectedName = selectedCount > 0 ? input.files?.[0]?.name ?? "" : "";
+        const uploadContainer = input.closest(".file-upload__wrapper") ?? input.parentElement ?? document.body;
+        const uploadContainerText = (uploadContainer.textContent || "").trim();
+        const uploadContainerTextLower = uploadContainerText.toLowerCase();
+        const uploadErrorText = Array.from(uploadContainer.querySelectorAll("*"))
+          .map((element) => (element.textContent || "").trim())
+          .find((text) => /cannot read properties of undefined.*uploadfile/i.test(text)) ?? null;
+        const candidateNames = [selectedName, payload.expectedFileName]
+          .map((name) => (name || "").trim().toLowerCase())
+          .filter((name) => name.length > 0);
+        const matchedFileName =
+          candidateNames.find((name) => uploadContainerTextLower.includes(name) || documentTextLower.includes(name)) ?? null;
+        const hasFilenameText = matchedFileName !== null;
+
+        return {
+          selectedCount,
+          selectedName,
+          uploadErrorText,
+          hasFilenameText,
+          matchedFileName,
+          uploadContainerPreview: uploadContainerText.slice(0, 400)
+        };
+      },
+      { mode: "inspect-upload", index, expectedFileName, domId, domName }
+    )
+    .catch(() => null);
+
+  if (!inspected || typeof inspected !== "object" || typeof (inspected as { selectedCount?: unknown }).selectedCount !== "number") {
+    // If DOM inspection is unavailable, do not block a successful setInputFiles call.
+    return {
+      selectedCount: 1,
+      selectedName: "",
+      uploadErrorText: null,
+      hasFilenameText: true,
+      matchedFileName: expectedFileName ?? null,
+      uploadContainerPreview: "inspection unavailable"
+    };
+  }
+
+  return inspected as {
+    selectedCount: number;
+    selectedName: string;
+    uploadErrorText: string | null;
+    hasFilenameText: boolean;
+    matchedFileName: string | null;
+    uploadContainerPreview: string;
+  };
+}
+
+async function dispatchFileSelectionEvents(
+  page: AutomationPage,
+  index: number,
+  domId?: string,
+  domName?: string
+): Promise<{ dispatched: boolean; error: string | null }> {
+  const result = await page
+    .evaluate(
+      (payload: { mode: "dispatch-file-events"; index: number; domId?: string; domName?: string }) => {
+        try {
+          const inputs = Array.from(document.querySelectorAll("input[type='file']"));
+          const input =
+            inputs.find((candidate) => payload.domId && (candidate as HTMLInputElement).id === payload.domId) ??
+            inputs.find((candidate) => payload.domName && (candidate as HTMLInputElement).name === payload.domName) ??
+            (inputs[payload.index] as HTMLInputElement | undefined);
+          if (!input) {
+            return { dispatched: false, error: "input not found" };
+          }
+
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          return { dispatched: true, error: null };
+        } catch (error) {
+          return { dispatched: false, error: String(error) };
+        }
+      },
+      { mode: "dispatch-file-events", index, domId, domName }
+    )
+    .catch((error) => ({ dispatched: false, error: String(error) }));
+
+  if (!result || typeof result !== "object") {
+    return { dispatched: false, error: "unknown dispatch result" };
+  }
+
+  return {
+    dispatched: Boolean((result as { dispatched?: unknown }).dispatched),
+    error: typeof (result as { error?: unknown }).error === "string" ? ((result as { error?: string }).error ?? null) : null
+  };
+}
+
 async function applyUploads(
   page: AutomationPage,
   plan: UploadPlan,
-  onEvent?: (level: "info" | "warn" | "error" | "success", message: string) => void
+  onEvent?: (level: "info" | "warn" | "error" | "success", message: string) => void,
+  debugLog?: UploadDebugLog
 ): Promise<{ uploadedFiles: UploadedFileResult[]; blockers: string[]; consistencyWarnings: string[] }> {
   const uploadedFiles: UploadedFileResult[] = [];
   const blockers = [...plan.blockers];
   const consistencyWarnings: string[] = [];
   const fileInputs = page.locator("input[type='file']");
   const count = await fileInputs.count();
+  debugLog?.("apply_uploads_started", {
+    plannedUploads: plan.uploads.map((upload) => ({
+      index: upload.index,
+      label: upload.label,
+      classification: upload.classification,
+      filePath: upload.filePath,
+      required: upload.required,
+      domId: upload.domId,
+      domName: upload.domName
+    })),
+    planBlockers: plan.blockers,
+    domFileInputCount: count
+  });
 
   for (const upload of plan.uploads) {
-    if (upload.index >= count) {
-      blockers.push(`File field disappeared before upload: ${upload.label}`);
-      uploadedFiles.push({
-        fieldLabel: upload.label,
-        classification: upload.classification,
-        filePath: upload.filePath,
-        required: upload.required,
-        outcome: "blocked"
-      });
-      continue;
+    debugLog?.("upload_attempt_started", {
+      index: upload.index,
+      label: upload.label,
+      classification: upload.classification,
+      filePath: upload.filePath,
+      required: upload.required,
+      domId: upload.domId,
+      domName: upload.domName,
+      domFileInputCount: count
+    });
+
+    let locator: AutomationLocator | null = null;
+    if (upload.domId) {
+      const escapedId = upload.domId.replace(/\\/g, "\\\\").replace(/\"/g, '\\\"');
+      const byId = page.locator(`input[type='file'][id=\"${escapedId}\"]`);
+      const byIdCount = await byId.count();
+      if (byIdCount > 0) {
+        locator = byId.nth(0);
+      }
     }
 
-    const locator = fileInputs.nth(upload.index);
+    if (!locator && upload.domName) {
+      const escapedName = upload.domName.replace(/\\/g, "\\\\").replace(/\"/g, '\\\"');
+      const byName = page.locator(`input[type='file'][name=\"${escapedName}\"]`);
+      const byNameCount = await byName.count();
+      if (byNameCount > 0) {
+        locator = byName.nth(0);
+      }
+    }
+
+    if (!locator) {
+      if (upload.index >= count) {
+        blockers.push(`File field disappeared before upload: ${upload.label}`);
+        debugLog?.("upload_blocked_input_disappeared", {
+          index: upload.index,
+          label: upload.label,
+          domId: upload.domId,
+          domName: upload.domName,
+          domFileInputCount: count
+        });
+        uploadedFiles.push({
+          fieldLabel: upload.label,
+          classification: upload.classification,
+          filePath: upload.filePath,
+          required: upload.required,
+          outcome: "blocked"
+        });
+        continue;
+      }
+
+      locator = fileInputs.nth(upload.index);
+    }
+
     try {
-      // Set the files on the input element
       await locator.setInputFiles(upload.filePath);
-      
-      // Dispatch events to notify any custom upload handlers
-      await page.evaluate((index: number) => {
-        const inputs = document.querySelectorAll("input[type='file']");
-        if (inputs[index]) {
-          const input = inputs[index] as HTMLInputElement;
-          // Dispatch input event
-          input.dispatchEvent(new Event("input", { bubbles: true }));
-          // Dispatch change event
-          input.dispatchEvent(new Event("change", { bubbles: true }));
-        }
-      }, upload.index);
-      
-      // Wait a moment for upload handlers to process
-      await (page.waitForTimeout?.(500) ?? new Promise((resolve) => setTimeout(resolve, 500)));
-      
+      debugLog?.("upload_set_input_files_succeeded", {
+        index: upload.index,
+        label: upload.label,
+        filePath: upload.filePath
+      });
     } catch (error) {
       blockers.push(`Upload failed for ${upload.label}: ${String(error)}`);
+      debugLog?.("upload_set_input_files_failed", {
+        index: upload.index,
+        label: upload.label,
+        filePath: upload.filePath,
+        error: String(error)
+      });
       uploadedFiles.push({
         fieldLabel: upload.label,
         classification: upload.classification,
@@ -662,38 +814,116 @@ async function applyUploads(
       continue;
     }
 
-    onEvent?.("info", `Uploaded ${upload.classification} to ${upload.label}`);
-    
-    // Try to verify the upload was detected by the UI
-    const uploadVerified = await page.evaluate((index: number) => {
-      const inputs = document.querySelectorAll("input[type='file']");
-      if (!inputs[index]) return false;
-      
-      const input = inputs[index] as HTMLInputElement;
-      // Check if files are present in the input element
-      if (input.files && input.files.length > 0) {
-        return true;
-      }
-      
-      // Check for indicators that upload was processed (looking for filename display, remove button, etc)
-      const parent = input.parentElement;
-      if (parent) {
-        const parentText = parent.textContent || "";
-        // Look for filename or common upload UI indicators
-        if (parentText.includes(".pdf") || parentText.includes(".doc") || parentText.includes("Remove") || parentText.includes("uploaded")) {
-          return true;
-        }
-      }
-      
-      return false;
-    }, upload.index);
-    
+    const expectedFileName = path.basename(upload.filePath).toLowerCase();
+    const uploadInspectionImmediate = await inspectUploadResult(
+      page,
+      upload.index,
+      expectedFileName,
+      upload.domId,
+      upload.domName
+    );
+    await (page.waitForTimeout?.(1200) ?? new Promise((resolve) => setTimeout(resolve, 1200)));
+    let uploadInspection = await inspectUploadResult(page, upload.index, expectedFileName, upload.domId, upload.domName);
+    let dispatchResult: { dispatched: boolean; error: string | null } | null = null;
+
+    if (uploadInspection.selectedCount <= 0 && !uploadInspection.hasFilenameText) {
+      dispatchResult = await dispatchFileSelectionEvents(page, upload.index, upload.domId, upload.domName);
+      debugLog?.("upload_events_dispatched_as_fallback", {
+        index: upload.index,
+        label: upload.label,
+        dispatched: dispatchResult.dispatched,
+        error: dispatchResult.error
+      });
+
+      await (page.waitForTimeout?.(800) ?? new Promise((resolve) => setTimeout(resolve, 800)));
+      uploadInspection = await inspectUploadResult(page, upload.index, expectedFileName, upload.domId, upload.domName);
+    }
+
+    debugLog?.("upload_post_inspection", {
+      index: upload.index,
+      label: upload.label,
+      immediate: uploadInspectionImmediate,
+      delayed: uploadInspection,
+      fallbackDispatch: dispatchResult
+    });
+
+    if (uploadInspection.uploadErrorText && uploadInspection.selectedCount <= 0 && !uploadInspection.hasFilenameText) {
+      blockers.push(`Upload widget reported an error for ${upload.label}: ${uploadInspection.uploadErrorText}`);
+      consistencyWarnings.push(`Upload widget error detected for ${upload.label}`);
+      debugLog?.("upload_blocked_widget_error", {
+        index: upload.index,
+        label: upload.label,
+        uploadErrorText: uploadInspection.uploadErrorText
+      });
+      uploadedFiles.push({
+        fieldLabel: upload.label,
+        classification: upload.classification,
+        filePath: upload.filePath,
+        required: upload.required,
+        outcome: "blocked"
+      });
+      continue;
+    }
+
+    if (uploadInspection.uploadErrorText) {
+      consistencyWarnings.push(
+        `Upload widget displayed an error for ${upload.label} but filename evidence was present`
+      );
+      debugLog?.("upload_widget_error_non_blocking", {
+        index: upload.index,
+        label: upload.label,
+        uploadErrorText: uploadInspection.uploadErrorText,
+        selectedCount: uploadInspection.selectedCount,
+        hasFilenameText: uploadInspection.hasFilenameText,
+        matchedFileName: uploadInspection.matchedFileName
+      });
+    }
+
+    if (uploadInspection.selectedCount <= 0 && !uploadInspection.hasFilenameText) {
+      blockers.push(`File was not selected after upload attempt for ${upload.label}`);
+      consistencyWarnings.push(`Upload phase found no selected file for ${upload.label}`);
+      debugLog?.("upload_blocked_no_selected_file", {
+        index: upload.index,
+        label: upload.label
+      });
+      uploadedFiles.push({
+        fieldLabel: upload.label,
+        classification: upload.classification,
+        filePath: upload.filePath,
+        required: upload.required,
+        outcome: "blocked"
+      });
+      continue;
+    }
+
+    if (!uploadInspection.hasFilenameText) {
+      consistencyWarnings.push(
+        `Upload phase selected a file input for ${upload.label}, but the UI did not render a filename`
+      );
+      debugLog?.("upload_filename_not_rendered_non_blocking", {
+        index: upload.index,
+        label: upload.label,
+        selectedName: uploadInspection.selectedName,
+        uploadContainerPreview: uploadInspection.uploadContainerPreview
+      });
+    }
+
+    onEvent?.(
+      "info",
+      `Uploaded ${upload.classification} to ${upload.label}${uploadInspection.selectedName ? ` (${uploadInspection.selectedName})` : ""}`
+    );
+    debugLog?.("upload_marked_success", {
+      index: upload.index,
+      label: upload.label,
+      classification: upload.classification,
+      selectedName: uploadInspection.selectedName
+    });
     uploadedFiles.push({
       fieldLabel: upload.label,
       classification: upload.classification,
       filePath: upload.filePath,
       required: upload.required,
-      outcome: uploadVerified ? "uploaded" : "uploaded"
+      outcome: "uploaded"
     });
   }
 
@@ -861,11 +1091,19 @@ export async function applyToJob(args: {
   }
 
   const startedAt = Date.now();
+  const uploadDebug = createUploadDebugLogger(args.jobId);
+  const debugLog = uploadDebug.log;
   let screenshotPath: string | undefined;
   let stagehand: Stagehand | undefined;
   let browserKeptOpen = false;
 
   try {
+    debugLog("run_started", {
+      jobUrl: args.jobUrl,
+      resumePath: args.profile.settings.resumePath,
+      coverLetterPath: args.profile.settings.coverLetterPath,
+      attachmentMappings: args.profile.settings.attachmentMappings
+    });
     args.setStatus?.("starting", "Launching browser session");
     args.updateRunState?.({
       phase: "starting",
@@ -893,6 +1131,7 @@ export async function applyToJob(args: {
     });
 
     await stagehand.init();
+    debugLog("stagehand_initialized");
     const page = stagehand.context.pages()[0] as unknown as AutomationPage;
     const takeScreenshot = async () => {
       const screenshotDir = path.resolve("./logs/screenshots");
@@ -907,14 +1146,17 @@ export async function applyToJob(args: {
     args.setStatus?.("running", "Navigating to application page");
     await page.goto(args.jobUrl);
     await page.waitForLoadState("domcontentloaded");
+    debugLog("navigated_to_job_url", { url: args.jobUrl });
 
     const iframeDiscoveryTimeoutMs = shouldUseExtendedIframeDiscovery(args.jobUrl) ? 8000 : 2000;
     const iframeUrls = await discoverIframeUrls(page, iframeDiscoveryTimeoutMs);
+    debugLog("iframe_discovery_complete", { iframeUrls, timeoutMs: iframeDiscoveryTimeoutMs });
     const targetUrl = resolveApplicationTargetUrl(args.jobUrl, iframeUrls);
     if (targetUrl !== args.jobUrl) {
       args.onEvent?.("info", `Navigating directly to embedded application: ${targetUrl}`);
       await page.goto(targetUrl);
       await page.waitForLoadState("domcontentloaded");
+      debugLog("navigated_to_embedded_application", { targetUrl });
     }
 
     const agent = stagehand.agent({
@@ -932,12 +1174,25 @@ export async function applyToJob(args: {
     let fileInputDescriptors: FileInputDescriptor[] = [];
     try {
       fileInputDescriptors = await listFileInputs(page);
+      debugLog("file_inputs_discovered", {
+        descriptors: fileInputDescriptors
+      });
     } catch (error) {
       args.onEvent?.("warn", `Failed to inspect file inputs: ${String(error)}`);
       fileInputDescriptors = [];
+      debugLog("file_input_discovery_failed", { error: String(error) });
     }
     const initialUploadPlan = planFileUploads(args.profile.settings, fileInputDescriptors);
-    const initialUploadPhase = await applyUploads(page, initialUploadPlan, args.onEvent);
+    debugLog("initial_upload_plan", {
+      uploads: initialUploadPlan.uploads,
+      blockers: initialUploadPlan.blockers
+    });
+    const initialUploadPhase = await applyUploads(page, initialUploadPlan, args.onEvent, debugLog);
+    debugLog("initial_upload_phase_result", {
+      uploadedFiles: initialUploadPhase.uploadedFiles,
+      blockers: initialUploadPhase.blockers,
+      consistencyWarnings: initialUploadPhase.consistencyWarnings
+    });
     appendUploadedFiles(uploadedFiles, initialUploadPhase.uploadedFiles);
     let combinedWarnings = [...initialUploadPhase.consistencyWarnings];
     if (combinedWarnings.length > 0) {
@@ -1069,12 +1324,25 @@ export async function applyToJob(args: {
       let uploadFileInputDescriptors: FileInputDescriptor[] = [];
       try {
         uploadFileInputDescriptors = await listFileInputs(page);
+        debugLog("file_inputs_rediscovered_after_fill", {
+          descriptors: uploadFileInputDescriptors
+        });
       } catch (error) {
         args.onEvent?.("warn", `Failed to re-inspect file inputs after fill phase: ${String(error)}`);
         uploadFileInputDescriptors = [];
+        debugLog("file_input_rediscovery_failed_after_fill", { error: String(error) });
       }
       const uploadPlan = planFileUploads(args.profile.settings, uploadFileInputDescriptors);
-      const uploadPhase = await applyUploads(page, uploadPlan, args.onEvent);
+      debugLog("followup_upload_plan", {
+        uploads: uploadPlan.uploads,
+        blockers: uploadPlan.blockers
+      });
+      const uploadPhase = await applyUploads(page, uploadPlan, args.onEvent, debugLog);
+      debugLog("followup_upload_phase_result", {
+        uploadedFiles: uploadPhase.uploadedFiles,
+        blockers: uploadPhase.blockers,
+        consistencyWarnings: uploadPhase.consistencyWarnings
+      });
       appendUploadedFiles(uploadedFiles, uploadPhase.uploadedFiles);
       combinedWarnings = [...combinedWarnings, ...uploadPhase.consistencyWarnings];
       if (combinedWarnings.length > 0) {
@@ -1228,6 +1496,7 @@ export async function applyToJob(args: {
       consistencyWarnings: allWarnings
     });
   } catch (error) {
+    debugLog("run_failed", { error: String(error) });
     args.onEvent?.("error", String(error));
     args.setStatus?.("failed", "Run failed");
     browserKeptOpen = shouldKeepBrowserOpen(args.profile.settings.keepBrowserOpenPolicy, "failed", "none");
@@ -1249,6 +1518,7 @@ export async function applyToJob(args: {
       browserKeptOpen
     });
   } finally {
+    debugLog("run_finished", { browserKeptOpen, screenshotPath, debugLogPath: uploadDebug.logPath });
     if (!browserKeptOpen) {
       await stagehand?.close().catch(() => undefined);
     }

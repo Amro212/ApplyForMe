@@ -6,3 +6,5 @@ profiles/jobs.json
 logs/applications.json
 logs/screenshots/
 coverage/
+logs/
+.agents/
